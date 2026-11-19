@@ -214,21 +214,28 @@ def _run_linter(
     logging.debug('%s: Files to consider: %s', linter.name,
                   ' '.join(filenames))
     logging.debug('%s: Running with %d threads', linter.name, args.jobs)
-    files = dict((filename, git_tools.file_contents(args, _ROOT, filename))
-                 for filename in filenames)
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=args.jobs) as executor:
-        futures = [
-            executor.submit(_run_linter_one, linter, filename, contents,
-                            validate_only, diagnostics_output)
-            for filename, contents in files.items()
-        ]
-        results = [
-            f.result() for f in concurrent.futures.as_completed(futures)
-        ]
-    results.extend(
-        _run_linter_all(args, linter, filenames, validate_only,
-                        diagnostics_output))
+    # ponytail: batch linters already launch one process. A thread per file
+    # would run that work once per file.
+    if getattr(linter, 'batch', False):
+        results = list(
+            _run_linter_all(args, linter, filenames, validate_only,
+                            diagnostics_output))
+    else:
+        files = dict((filename, git_tools.file_contents(args, _ROOT, filename))
+                     for filename in filenames)
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=args.jobs) as executor:
+            futures = [
+                executor.submit(_run_linter_one, linter, filename, contents,
+                                validate_only, diagnostics_output)
+                for filename, contents in files.items()
+            ]
+            results = [
+                f.result() for f in concurrent.futures.as_completed(futures)
+            ]
+        results.extend(
+            _run_linter_all(args, linter, filenames, validate_only,
+                            diagnostics_output))
     return (set(violation for violation, _ in results
                 if violation is not None),
             any(fixable for _, fixable in results))
