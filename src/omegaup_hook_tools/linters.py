@@ -49,7 +49,7 @@ def _which(program: Text) -> Text:
 
 
 _TIDY_PATH = os.path.join(git_tools.HOOK_TOOLS_ROOT, 'data/tidy')
-_PRETTIER_RE = re.compile(r'^(?:[^\s:]+\s*)?[^\s:]+: (.*) \((\d+):(\d+)\)\s*$')
+_FORMAT_RE = re.compile(r'^(?:[^\s:]+\s*)?[^\s:]+: (.*) \((\d+):(\d+)\)\s*$')
 _DIAGNOSTIC_RE = re.compile(r'^([^:\s]+):(\d+):(\d+): (.*)$')
 
 Options = Mapping[str, Any]
@@ -190,7 +190,7 @@ def _lint_javascript(filename: Text,
             except subprocess.CalledProcessError as cpe:
                 diagnostics: List[Diagnostic] = []
                 for line in cpe.output.strip().split('\n'):
-                    match = _PRETTIER_RE.match(line)
+                    match = _FORMAT_RE.match(line)
                     if not match:
                         continue
                     diagnostics.append(
@@ -255,7 +255,7 @@ def _lint_oxfmt(contents: bytes, filename: Text) -> bytes:
         diagnostics: List[Diagnostic] = []
         for line in result.stderr.decode('utf-8',
                                          errors='replace').strip().split('\n'):
-            match = _PRETTIER_RE.match(line)
+            match = _FORMAT_RE.match(line)
             if not match:
                 continue
             diagnostics.append(
@@ -1088,8 +1088,8 @@ class ClangFormatLinter(Linter):
         return 'clang-format'
 
 
-class EslintLinter(Linter):
-    '''Runs oxlint. The config key stays `eslint`.'''
+class OxlintLinter(Linter):
+    '''Runs oxlint.'''
 
     # pylint: disable=R0903
 
@@ -1132,18 +1132,18 @@ class EslintLinter(Linter):
                             lineno=lineno,
                             col=int(match.group(3)) or None,
                         ))
-                raise LinterException('Eslint lint errors',
+                raise LinterException('oxlint errors',
                                       fixable=False,
                                       diagnostics=diagnostics)
             with open(tmp.name, 'rb') as fixed:
                 new_contents = fixed.read()
         if new_contents != contents:
-            return SingleResult(new_contents, ['eslint'])
+            return SingleResult(new_contents, ['oxlint'])
         return SingleResult(contents, [])
 
     @property
     def name(self) -> Text:
-        return 'eslint'
+        return 'oxlint'
 
 
 class CustomLinter(Linter):

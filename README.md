@@ -24,6 +24,7 @@ linters soportados (con sus respectivas opciones) son:
 * `html`: Corre HTML Tidy.
   * `strict`: Un bool que indica si se va a correr en modo estricto
 * `javascript`: Corre el formateador [Oxfmt](https://oxc.rs/docs/guide/usage/formatter).
+* `oxlint`: Corre [Oxlint](https://oxc.rs/docs/guide/usage/linter).
   * `extra_js_linters`: Un arreglo con comandos que se van a correr.
 * `json`: Corre el formateador [Oxfmt](https://oxc.rs/docs/guide/usage/formatter).
 * `karel`: Corre el formateador [Oxfmt](https://oxc.rs/docs/guide/usage/formatter).

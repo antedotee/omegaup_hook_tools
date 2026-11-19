@@ -23,7 +23,7 @@ LinterFactory = Callable[..., linters.Linter]
 
 _LINTER_MAPPING: Dict[Text, LinterFactory] = {
     'clang-format': linters.ClangFormatLinter,
-    'eslint': linters.EslintLinter,
+    'oxlint': linters.OxlintLinter,
     'html': linters.HTMLLinter,
     'javascript': linters.JavaScriptLinter,
     'json': linters.JsonLinter,
