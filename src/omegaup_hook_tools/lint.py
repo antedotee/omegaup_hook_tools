@@ -211,6 +211,8 @@ def _run_linter(
         filenames: Sequence[Text], validate_only: bool,
         diagnostics_output: DiagnosticsOutput) -> Tuple[Set[Text], bool]:
     '''Runs the linter against all files.'''
+    if not filenames:
+        return set(), False
     logging.debug('%s: Files to consider: %s', linter.name,
                   ' '.join(filenames))
     logging.debug('%s: Running with %d threads', linter.name, args.jobs)
@@ -335,6 +337,9 @@ def main() -> None:
         filtered_files = [
             filename for filename in filtered_files
             if all(not r.match(filename) for r in denylist)]
+        # ponytail: skip linters when 0 files match allowlist/denylist.
+        if not filtered_files:
+            continue
         local_violations, local_fixable = _run_linter(
             args, linter(options), filtered_files,
             validate_only, args.diagnostics_output)

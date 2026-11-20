@@ -150,6 +150,49 @@ def _process_diagnostics_output(
     return diagnostics
 
 
+def _write_batch_files(
+        raw_tmpdir: str,
+        files: Sequence[Tuple[str, bytes]]) -> Dict[str, str]:
+    '''Materializes |files| under |raw_tmpdir| and maps realpath -> name.'''
+    tmpdir = os.path.realpath(raw_tmpdir)
+    path_to_name: Dict[str, str] = {}
+    for filename, contents in files:
+        path = os.path.join(tmpdir, filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as outf:
+            outf.write(contents)
+        path_to_name[path] = filename
+    return path_to_name
+
+
+def _parse_batch_diagnostics(
+        output: str, toolname: Optional[str], path_to_name: Mapping[str, str],
+        original: Mapping[str, bytes]) -> List[Diagnostic]:
+    '''Parses path:line:col: message output for a batch of files.'''
+    diagnostics: List[Diagnostic] = []
+    for line in output.strip().split('\n'):
+        match = _DIAGNOSTIC_RE.match(line.strip())
+        if not match:
+            continue
+        reported = (path_to_name.get(match.group(1))
+                    or path_to_name.get(os.path.realpath(match.group(1))))
+        if reported is None:
+            continue
+        lines = original[reported].decode('utf-8').split('\n')
+        lineno = int(match.group(2))
+        diagnostics.append(
+            Diagnostic(
+                (f'[{toolname}] {match.group(4)}'
+                 if toolname else match.group(4)),
+                filename=reported,
+                lineno=lineno,
+                line=(lines[lineno - 1].rstrip()
+                      if lineno <= len(lines) else ''),
+                col=int(match.group(3)) or None,
+            ))
+    return diagnostics
+
+
 def _custom_command(command: Text, filename: Text,
                     original_filename: Text) -> List[Text]:
     '''A custom command.'''
@@ -800,7 +843,7 @@ class PHPLinter(Linter):
 
     # pylint: disable=R0903
 
-    # ponytail: one phpcbf and one phpcs. Per-file processes were the cost.
+    # ponytail: parallel phpcs first; phpcbf only on files that failed.
     batch = True
 
     def __init__(self, options: Optional[Options] = None) -> None:
@@ -810,11 +853,16 @@ class PHPLinter(Linter):
             'standard',
             os.path.join(git_tools.HOOK_TOOLS_ROOT,
                          'data/phpcbf/Standards/OmegaUp/ruleset.xml'))
-        self.__common_args = ['--encoding=utf-8', f'--standard={standard}']
+        self.__common_args = [
+            '--encoding=utf-8',
+            f'--standard={standard}',
+            f'--parallel={os.cpu_count() or 1}',
+        ]
 
-    def _phpcs(self, paths: Sequence[str], path_to_name: Mapping[str, str],
-               original: Mapping[str, bytes]) -> None:
-        '''Raises if phpcs reports anything for |paths|.'''
+    def _phpcs_check(self, paths: Sequence[str],
+                     path_to_name: Mapping[str, str],
+                     original: Mapping[str, bytes]) -> List[Diagnostic]:
+        '''Returns diagnostics from one parallel phpcs pass.'''
         args = ([_which('phpcs'), '-s', '-q'] + self.__common_args
                 + ['--report=emacs'] + list(paths))
         logging.debug('lint_php: Running %s', shlex.join(args))
@@ -823,68 +871,45 @@ class PHPLinter(Linter):
                                 stderr=subprocess.PIPE,
                                 check=False)
         if result.returncode == 0:
-            return
+            return []
         output = result.stdout.decode('utf-8', errors='replace')
-        diagnostics: List[Diagnostic] = []
-        for line in output.strip().split('\n'):
-            match = _DIAGNOSTIC_RE.match(line.strip())
-            if not match:
-                continue
-            reported = path_to_name.get(match.group(1))
-            if reported is None:
-                continue
-            lines = original[reported].decode('utf-8').split('\n')
-            lineno = int(match.group(2))
-            diagnostics.append(
-                Diagnostic(
-                    match.group(4),
-                    filename=reported,
-                    lineno=lineno,
-                    line=(lines[lineno - 1].rstrip()
-                          if lineno <= len(lines) else ''),
-                    col=int(match.group(3)) or None,
-                ))
+        diagnostics = _parse_batch_diagnostics(output, None, path_to_name,
+                                               original)
         if not diagnostics:
             raise LinterException(
                 result.stderr.decode('utf-8', errors='replace') or output)
-        raise LinterException('phpcs lint errors',
-                              fixable=False,
-                              diagnostics=diagnostics)
+        return diagnostics
 
     def _lint(self, files: Sequence[Tuple[str, bytes]]) -> Dict[str, bytes]:
-        '''One phpcbf, then phpcs on the files that did not change.'''
+        '''Parallel phpcs first; phpcbf only on files that failed.'''
         if not files:
             return {}
         original = dict(files)
         changed: Dict[str, bytes] = {}
-        with tempfile.TemporaryDirectory(prefix='php_linter_') as tmpdir:
-            path_to_name: Dict[str, str] = {}
-            for filename, contents in files:
-                path = os.path.join(tmpdir, filename)
-                directory = os.path.dirname(path)
-                if directory:
-                    os.makedirs(directory, exist_ok=True)
-                with open(path, 'wb') as phpfile:
-                    phpfile.write(contents)
-                path_to_name[path] = filename
-
-            args = [_which('phpcbf')] + self.__common_args + list(path_to_name)
-            logging.debug('lint_php: Running %s', shlex.join(args))
-            subprocess.run(args,
+        with tempfile.TemporaryDirectory(prefix='php_linter_') as raw_tmpdir:
+            path_to_name = _write_batch_files(raw_tmpdir, files)
+            diagnostics = self._phpcs_check(list(path_to_name), path_to_name,
+                                            original)
+            if not diagnostics:
+                return {}
+            name_to_path = {name: path for path, name in path_to_name.items()}
+            failing = list(
+                dict.fromkeys(name_to_path[d.filename] for d in diagnostics))
+            subprocess.run([_which('phpcbf')] + self.__common_args + failing,
                            stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE,
                            check=False)
-
-            unchanged: List[str] = []
-            for path, filename in path_to_name.items():
+            for path in failing:
+                filename = path_to_name[path]
                 with open(path, 'rb') as phpfile:
                     fixed = phpfile.read()
                 if fixed != original[filename]:
                     changed[filename] = fixed
-                else:
-                    unchanged.append(path)
-            if unchanged:
-                self._phpcs(unchanged, path_to_name, original)
+            unfixed = [d for d in diagnostics if d.filename not in changed]
+            if unfixed:
+                raise LinterException('phpcs lint errors',
+                                      fixable=False,
+                                      diagnostics=unfixed)
         return changed
 
     def run_one(self, filename: str, contents: bytes) -> SingleResult:
@@ -920,6 +945,8 @@ class PythonLinter(Linter):
         self.__options = options or {}
 
     def run_one(self, filename: str, contents: bytes) -> SingleResult:
+        # ponytail: keep pylint isolated per file; sharing one astroid cache
+        # resolves unrelated same-named modules across stuff/ subdirectories.
         diagnostics: List[Diagnostic] = []
         lines = contents.decode('utf-8').split('\n')
         with tempfile.TemporaryDirectory(prefix='python_linter_') as tmpdir:
@@ -953,8 +980,6 @@ class PythonLinter(Linter):
                                                 cpe.output.strip(),
                                                 toolname='pycodestyle'))
 
-            # We need to disable import-error/no-name-in-module since the file
-            # won't be checked in the repository, but in a temporary directory.
             args = [
                 python3,
                 '-m',
@@ -1006,38 +1031,19 @@ class PythonLinter(Linter):
             *filenames,
         ]
         logging.debug('lint_python: Running %s', args)
-        try:
-            subprocess.run(args,
-                           check=True,
-                           stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT,
-                           universal_newlines=True)
-        except subprocess.CalledProcessError as cpe:
-            known = set(filenames)
-            contents = {
-                filename: contents_callback(filename)
-                for filename in filenames
-            }
-            diagnostics: List[Diagnostic] = []
-            for line in cpe.output.strip().split('\n'):
-                match = _DIAGNOSTIC_RE.match(line.strip())
-                if not match or match.group(1) not in known:
-                    continue
-                filename = match.group(1)
-                lines = contents[filename].decode('utf-8').split('\n')
-                lineno = int(match.group(2))
-                diagnostics.append(
-                    Diagnostic(
-                        f'[mypy] {match.group(4)}',
-                        filename=filename,
-                        lineno=lineno,
-                        line=(lines[lineno - 1].rstrip()
-                              if lineno <= len(lines) else ''),
-                        col=int(match.group(3)) or None,
-                    ))
-            raise LinterException('Python lint errors',
-                                  fixable=False,
-                                  diagnostics=diagnostics) from cpe
+        result = subprocess.run(args,
+                                check=False,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                universal_newlines=True)
+        if result.returncode != 0:
+            original = {name: contents_callback(name) for name in filenames}
+            raise LinterException(
+                'Python lint errors',
+                fixable=False,
+                diagnostics=_parse_batch_diagnostics(
+                    result.stdout, 'mypy', {name: name for name in filenames},
+                    original))
         return MultipleResults(new_contents={}, original_contents={})
 
     @property
@@ -1093,19 +1099,23 @@ class OxlintLinter(Linter):
 
     # pylint: disable=R0903
 
+    # ponytail: one oxlint process over relative paths instead of N tmpfiles.
+    batch = True
+
     def __init__(self, options: Optional[Options] = None) -> None:
         super().__init__()
         del options
 
-    def run_one(self, filename: str, contents: bytes) -> SingleResult:
-        suffix = os.path.splitext(filename)[1] or '.js'
-        with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
-            tmp.write(contents)
-            tmp.flush()
-            args = [
-                _which('oxlint'), '--fix', '--deny-warnings', '-f', 'unix',
-                tmp.name
-            ]
+    def _lint(self, files: Sequence[Tuple[str, bytes]]) -> Dict[str, bytes]:
+        if not files:
+            return {}
+        original = dict(files)
+        changed: Dict[str, bytes] = {}
+        with tempfile.TemporaryDirectory(
+                prefix='oxlint_linter_') as raw_tmpdir:
+            path_to_name = _write_batch_files(raw_tmpdir, files)
+            args = ([_which('oxlint'), '--fix', '--deny-warnings', '-f',
+                     'unix'] + list(path_to_name))
             config = os.path.join(os.getcwd(), '.oxlintrc.json')
             if os.path.isfile(config):
                 args[1:1] = ['-c', config]
@@ -1116,30 +1126,35 @@ class OxlintLinter(Linter):
                                     stderr=subprocess.STDOUT,
                                     universal_newlines=True)
             if result.returncode != 0:
-                lines = contents.decode('utf-8').split('\n')
-                diagnostics: List[Diagnostic] = []
-                for line in result.stdout.split('\n'):
-                    match = _DIAGNOSTIC_RE.match(line.strip())
-                    if not match:
-                        continue
-                    lineno = int(match.group(2))
-                    diagnostics.append(
-                        Diagnostic(
-                            f'[oxlint] {match.group(4)}',
-                            filename=filename,
-                            line=(lines[lineno - 1].rstrip()
-                                  if lineno <= len(lines) else ''),
-                            lineno=lineno,
-                            col=int(match.group(3)) or None,
-                        ))
-                raise LinterException('oxlint errors',
-                                      fixable=False,
-                                      diagnostics=diagnostics)
-            with open(tmp.name, 'rb') as fixed:
-                new_contents = fixed.read()
-        if new_contents != contents:
-            return SingleResult(new_contents, ['oxlint'])
-        return SingleResult(contents, [])
+                raise LinterException(
+                    'oxlint errors',
+                    fixable=False,
+                    diagnostics=_parse_batch_diagnostics(
+                        result.stdout, 'oxlint', path_to_name, original))
+            for path, filename in path_to_name.items():
+                with open(path, 'rb') as fixed_file:
+                    fixed = fixed_file.read()
+                if fixed != original[filename]:
+                    changed[filename] = fixed
+        return changed
+
+    def run_one(self, filename: str, contents: bytes) -> SingleResult:
+        changed = self._lint([(filename, contents)])
+        if filename not in changed:
+            return SingleResult(contents, [])
+        return SingleResult(changed[filename], ['oxlint'])
+
+    def run_all(self, filenames: Sequence[str],
+                contents_callback: ContentsCallback) -> MultipleResults:
+        files = [(filename, contents_callback(filename))
+                 for filename in filenames]
+        changed = self._lint(files)
+        return MultipleResults(
+            new_contents=changed,
+            original_contents={filename: contents
+                               for filename, contents in files
+                               if filename in changed},
+            violations=['oxlint'])
 
     @property
     def name(self) -> Text:

@@ -64,7 +64,7 @@ class TestLinters(unittest.TestCase):
                          linters.SingleResult(b'HELLO, WORLD!\n', ['command']))
 
     def test_javascript(self) -> None:
-        """Tests JavaScriptLinter."""
+        """Tests JavaScriptLinter and OxlintLinter."""
 
         linter = linters.JavaScriptLinter()
 
@@ -77,6 +77,12 @@ class TestLinters(unittest.TestCase):
             linter.run_one('test.js', b'#!/usr/bin/node\nreturn;\n'),
             linters.SingleResult(b'#!/usr/bin/node\nreturn;\n',
                                  ['javascript']))
+
+        oxlint = linters.OxlintLinter()
+        changed, _, _ = oxlint.run_all(
+            ['clean.js'],
+            lambda _: b'const answer = 42;\nexport default answer;\n')
+        self.assertEqual(changed, {})
 
     def test_vue(self) -> None:
         """Tests VueLinter."""
